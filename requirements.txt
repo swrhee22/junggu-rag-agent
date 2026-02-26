@@ -1,0 +1,8 @@
+streamlit
+langchain
+langgraph
+openai
+python-dotenv
+chromadb
+pypdf
+tiktoken
