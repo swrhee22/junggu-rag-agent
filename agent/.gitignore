@@ -1,4 +1,0 @@
-.env
-.venv
-db/chroma
-__pycache__/
