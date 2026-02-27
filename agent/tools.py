@@ -1,164 +1,114 @@
-# agent/tools.py
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
-import json
+from typing import Literal, List
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from dotenv import load_dotenv
+load_dotenv()
+
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
+from langchain_core.messages import SystemMessage, HumanMessage
 
-Route = Literal["blocked", "out_of_scope", "ambiguous", "in_scope"]
 
 DB_DIR = "db/chroma"
 COLLECTION_NAME = "junggu_guides"
 
 
-# ---------- 공용 LLM ----------
-def _router_llm() -> ChatOpenAI:
-    # 분기/판단은 최대한 deterministic하게
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+# -----------------------------
+# Guard (Hard block / Soft tone)
+# -----------------------------
+
+GuardAction = Literal["allow", "soft", "block"]
 
 
-# ---------- 1) Guard: 부적절 질문 판단 (LLM) ----------
 @dataclass
 class GuardResult:
-    allowed: bool
-    reason: str
+    action: GuardAction
+    message: str
+
+
+# 하드블락: 강한 욕설/혐오/성적 비하 등 “운영상 차단” 수준만
+HARD_BLOCK_PATTERNS = [
+    r"\b씨발\b", r"\b시발\b", r"\b병신\b", r"\b좆\b", r"\b좆같\b",
+    r"\b개새끼\b", r"\b썅\b",
+]
+
+# 소프트: 무례/짜증/비난투(차단까지는 X, 톤만 정리)
+SOFT_TONE_PATTERNS = [
+    r"\b니가\b", r"\b너가\b", r"\b뭐하냐\b", r"\b멍청\b", r"\b븅\b",
+]
+
+
+def _match_any(patterns: List[str], text: str) -> bool:
+    return any(re.search(p, text) for p in patterns)
 
 
 def guard_user_input(question: str) -> GuardResult:
-    """
-    사전 금지어가 아니라, LLM이 '부적절/모욕/혐오/성적/폭력/개인정보 요구' 등을 보고 판단.
-    - allowed=False이면 reason에 짧은 안내문을 넣어 반환.
-    """
-    llm = _router_llm()
+    q = question.strip()
 
-    system = """\
-너는 입력 안전성 필터다.
-사용자 질문이 부적절한지 판단해 JSON으로만 답해라.
+    # 1) 하드블락 룰 우선
+    if _match_any(HARD_BLOCK_PATTERNS, q):
+        return GuardResult(
+            action="block",
+            message="부적절한 표현이 포함되어 있어 답변할 수 없어요. 표현을 바꿔서 질문해 주세요."
+        )
 
-부적절 예시:
-- 욕설/모욕/비하/혐오 표현
-- 성적/폭력적/자해 조장
-- 개인정보(주민번호/계좌/정확한 주소 등) 요구
-- 불법 행위 조장
+    # 2) 소프트 톤 룰 (차단 X)
+    if _match_any(SOFT_TONE_PATTERNS, q):
+        return GuardResult(
+            action="soft",
+            message="사용자 표현이 다소 거칠 수 있음 → 정중하고 차분하게 응대"
+        )
 
-출력 형식(JSON only):
-{"allowed": true/false, "reason": "allowed가 false인 경우에만 사용자에게 보여줄 짧은 안내문"}"""
+    # 3) 그 외는 모델로 한 번 더 판정(원하는 ‘모델 판단’ 반영)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+    sys = SystemMessage(content=(
+        "너는 사용자 입력의 적절성을 분류하는 필터다.\n"
+        "분류는 오직 다음 중 하나로만 출력하라: ALLOW / SOFT / BLOCK\n"
+        "- BLOCK: 강한 욕설, 혐오/차별, 성적 비하, 폭력/자해 선동 등 운영상 차단이 필요한 경우\n"
+        "- SOFT: 무례/비난/짜증, 공격적 말투(그러나 차단까지는 아닌 경우)\n"
+        "- ALLOW: 그 외 정상 질문\n"
+        "추가 설명 없이 한 단어로만 출력하라."
+    ))
+    resp = llm.invoke([sys, HumanMessage(content=q)])
+    label = (resp.content or "").strip().upper()
 
-    user = f"사용자 질문: {question}"
-
-    resp = llm.invoke([
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ])
-
-    try:
-        data = json.loads(resp.content)
-        allowed = bool(data.get("allowed", True))
-        reason = str(data.get("reason", "")).strip()
-        if not allowed and not reason:
-            reason = "부적절한 표현이 포함되어 답변할 수 없어요. 표현을 바꿔서 질문해 주세요."
-        return GuardResult(allowed=allowed, reason=reason)
-    except Exception:
-        # 파싱 실패 시 보수적으로 통과(서비스 중단 방지) + 필요하면 로그로 남기기
-        return GuardResult(allowed=True, reason="")
+    if label == "BLOCK":
+        return GuardResult("block", "부적절한 표현이 포함되어 있어 답변할 수 없어요. 표현을 바꿔서 질문해 주세요.")
+    if label == "SOFT":
+        return GuardResult("soft", "사용자 표현이 다소 거칠 수 있음 → 정중하고 차분하게 응대")
+    return GuardResult("allow", "")
 
 
-# ---------- 2) Route: 중구 가이드 범위 판단 (LLM) ----------
-@dataclass
-class RouteResult:
-    route: Route
-    reason: str
-    clarify_question: Optional[str] = None
+# -----------------------------
+# Retriever
+# -----------------------------
 
-
-def route_question(question: str) -> RouteResult:
-    """
-    사용자의 질문이:
-    - out_of_scope: 서울 중구 가이드북 범위 밖(예: 부산/여수/해운대 등, 또는 중구 무관)
-    - ambiguous: 지역/대상이 모호해서 되묻기가 필요한 상태
-    - in_scope: 중구 가이드북 범위로 보이는 질문
-    을 LLM이 판단.
-    """
-    llm = _router_llm()
-
-    system = """\
-너는 '서울 중구 여행 가이드북 8종' 기반 챗봇의 라우터다.
-질문이 이 챗봇의 범위에 들어오는지 판단해라.
-
-범위(in_scope):
-- 서울 중구(명동/을지로/필동/장충동/광희동/회현동/소공동/중림동) 여행/관광/먹거리/볼거리/분위기/역사/코스/상점/문화 등
-
-범위 밖(out_of_scope):
-- 서울 중구가 아닌 지역(부산/해운대/여수/제주 등)
-- 여행/관광과 무관한 일반 지식(예: 코딩 숙제, 수학 문제 등)
-- '중구청 가는 길'처럼 실시간 길찾기/교통 경로 안내처럼
-  문서 기반으로 답하기 어려운 요청도 out_of_scope로 분류 가능(단, 애매하면 ambiguous)
-
-모호(ambiguous):
-- "중구 맛집 추천"처럼 중구는 맞는데 구체성이 너무 없어서
-  목적/동선/취향/예산/시간대 등을 물어봐야 답 품질이 나오는 경우
-- "여기 어디야?" 같이 맥락이 부족한 경우
-
-출력은 JSON only:
-{"route":"in_scope|out_of_scope|ambiguous", "reason":"한 줄 설명", "clarify_question":"ambiguous일 때만 사용자에게 되묻는 질문(없으면 null)"}"""
-
-    user = f"사용자 질문: {question}"
-
-    resp = llm.invoke([
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ])
-
-    try:
-        data = json.loads(resp.content)
-        route = data.get("route", "ambiguous")
-        if route not in ("in_scope", "out_of_scope", "ambiguous"):
-            route = "ambiguous"
-        reason = str(data.get("reason", "")).strip() or "질문 범위를 판단하기 어려워요."
-        cq = data.get("clarify_question", None)
-        if cq is not None:
-            cq = str(cq).strip()
-            if cq.lower() in ("null", ""):
-                cq = None
-        return RouteResult(route=route, reason=reason, clarify_question=cq)
-    except Exception:
-        return RouteResult(route="ambiguous", reason="질문 범위를 판단하기 어려워요.", clarify_question="서울 중구(명동/을지로/필동/장충동/광희동/회현동/소공동/중림동) 중 어디를 기준으로 추천해드릴까요?")
-
-
-# ---------- 3) Retriever / Sources ----------
-def get_vectorstore() -> Chroma:
+def get_retriever(k: int = 5):
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    return Chroma(
+    vectordb = Chroma(
         persist_directory=DB_DIR,
         embedding_function=embeddings,
         collection_name=COLLECTION_NAME,
     )
+    return vectordb.as_retriever(search_kwargs={"k": k})
 
 
-def retrieve_docs(question: str, k: int = 5) -> List:
-    vs = get_vectorstore()
-    # retriever 형태로도 가능하지만, 여기서는 단순히 docs만 반환
-    return vs.as_retriever(search_kwargs={"k": k}).invoke(question)
-
-
-def format_sources(docs: List) -> List[str]:
-    """
-    docs의 metadata(source_file, page)를 사람이 읽기 좋은 출처 문자열로 변환
-    """
-    sources = []
-    for d in docs or []:
-        src = d.metadata.get("source_file", "unknown")
-        page = d.metadata.get("page", None)
+def format_sources(docs) -> List[str]:
+    sources: List[str] = []
+    for d in docs:
+        meta = d.metadata or {}
+        f = meta.get("source_file", "unknown.pdf")
+        page = meta.get("page", None)
         if page is not None:
-            sources.append(f"{src}, page {int(page) + 1}")
+            sources.append(f"{f} (page {page+1})")
         else:
-            sources.append(src)
+            sources.append(f"{f}")
     # 중복 제거(순서 유지)
-    uniq = []
     seen = set()
+    uniq = []
     for s in sources:
         if s not in seen:
             uniq.append(s)
@@ -166,91 +116,70 @@ def format_sources(docs: List) -> List[str]:
     return uniq
 
 
-# ---------- 4) 답변 가능 여부 판단 (LLM) ----------
-@dataclass
-class AnswerabilityResult:
-    answerable: bool
-    reason: str
-    next_route: Literal["generate", "clarify", "out_of_scope"]
-    clarify_question: Optional[str] = None
+# -----------------------------
+# LLM-based routing (clarify 좁히기)
+# -----------------------------
+
+Route = Literal["out_of_scope", "ambiguous", "in_scope"]
 
 
-def judge_answerability(question: str, docs: List) -> AnswerabilityResult:
+def route_question_llm(question: str) -> Route:
     """
-    '이 문서 컨텍스트로 지금 질문에 답할 수 있는가?'를 LLM이 판단.
-    - answerable=True면 generate
-    - answerable=False면 clarify 또는 out_of_scope로 보냄
+    - in_scope: 중구 8개 동/명동/을지로/필동/장충/광희/회현/소공/중림 관련 질문.
+      목적이 불명확해도(‘명동 가볼만한 곳’) 기본은 in_scope로 두고 답하게 함.
+    - ambiguous: 지역/범위/의도 자체가 너무 불명확해서 되물어야 하는 경우
+      (예: '추천해줘', '맛집 알려줘'인데 지역 언급 없음)
+    - out_of_scope: 명백히 중구가 아닌 지역/주제(해운대, 여수, 제주 등)
     """
-    llm = _router_llm()
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
 
-    # 문서 컨텍스트를 너무 길게 주지 않기 (요약된 발췌만)
-    snippets = []
-    for i, d in enumerate(docs or [], start=1):
-        text = (d.page_content or "").strip().replace("\n", " ")
-        text = text[:600]  # 각 chunk 발췌 길이 제한
-        src = d.metadata.get("source_file", "unknown")
-        page = d.metadata.get("page", None)
-        if page is not None:
-            meta = f"{src} p{int(page)+1}"
-        else:
-            meta = src
-        snippets.append(f"[{i}] ({meta}) {text}")
+    sys = SystemMessage(content=(
+        "너는 질문을 3가지 중 하나로 라우팅한다: IN_SCOPE / AMBIGUOUS / OUT_OF_SCOPE.\n"
+        "IN_SCOPE 기준:\n"
+        "- 서울 '중구' 또는 중구의 대표 지역(명동, 을지로, 필동, 장충동, 광희동, 회현동, 소공동, 중림동)이 언급되면 기본은 IN_SCOPE.\n"
+        "- 목적이 불명확해도(예: '명동 가볼만한 곳') IN_SCOPE로 두고 일단 답변하도록 한다.\n"
+        "OUT_OF_SCOPE 기준:\n"
+        "- 중구와 무관한 다른 지역(예: 부산 해운대, 여수, 제주 등) 또는 명백히 다른 주제.\n"
+        "AMBIGUOUS 기준:\n"
+        "- 지역/범위가 전혀 없고, 무엇을 원하는지 너무 모호해서 질문을 좁혀야 할 때.\n"
+        "출력은 오직 한 단어로만: IN_SCOPE / AMBIGUOUS / OUT_OF_SCOPE"
+    ))
 
-    context = "\n".join(snippets) if snippets else "(검색된 문서 발췌 없음)"
+    resp = llm.invoke([sys, HumanMessage(content=question)])
+    label = (resp.content or "").strip().upper()
 
-    system = """\
-너는 '문서 기반 답변 가능 여부' 심사관이다.
-사용자 질문과 제공된 문서 발췌를 보고,
-- 이 발췌만으로 근거 있는 답변이 가능한지 판단하라.
-- 불가능하면 (1) 되묻기(clarify)가 필요한지, (2) 문서 범위 밖(out_of_scope)인지 결정하라.
+    if label == "OUT_OF_SCOPE":
+        return "out_of_scope"
+    if label == "AMBIGUOUS":
+        return "ambiguous"
+    return "in_scope"
 
-판단 기준:
-- 질문이 길찾기/교통 경로/실시간 정보 등 문서로 보장 못 하는 요청이면 out_of_scope 권장
-- 문서에 관련 단서가 거의 없으면 out_of_scope 또는 clarify
-- 사용자의 조건(시간대/취향/예산/동행/목적)이 부족해 추천 품질이 떨어지면 clarify
 
-출력(JSON only):
-{
-  "answerable": true/false,
-  "next_route": "generate|clarify|out_of_scope",
-  "reason": "한 줄 설명",
-  "clarify_question": "clarify일 때만 사용자에게 물어볼 질문(없으면 null)"
-}"""
+# -----------------------------
+# Answerability judge (문서로 답 가능?)
+# -----------------------------
 
-    user = f"""\
-사용자 질문: {question}
+def judge_answerability_llm(question: str, docs) -> bool:
+    """
+    '중구 관련'이라도,
+    - 길찾기/교통/실시간 정보/구청 가는 법 등
+    - 가이드북 PDF에 없을 확률이 높은 질문
+    을 문서 근거로 답할 수 있는지 판정.
+    """
+    # 검색 결과가 거의 없으면 답변 어렵다고 판단
+    if not docs:
+        return False
 
-문서 발췌:
-{context}
-"""
+    context = "\n\n".join([d.page_content for d in docs[:5]])
 
-    resp = llm.invoke([
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ])
-
-    try:
-        data = json.loads(resp.content)
-        answerable = bool(data.get("answerable", False))
-        next_route = data.get("next_route", "clarify")
-        if next_route not in ("generate", "clarify", "out_of_scope"):
-            next_route = "clarify"
-        reason = str(data.get("reason", "")).strip() or "문서 근거가 충분한지 판단하기 어려워요."
-        cq = data.get("clarify_question", None)
-        if cq is not None:
-            cq = str(cq).strip()
-            if cq.lower() in ("null", ""):
-                cq = None
-        return AnswerabilityResult(
-            answerable=answerable,
-            next_route=next_route,
-            reason=reason,
-            clarify_question=cq,
-        )
-    except Exception:
-        return AnswerabilityResult(
-            answerable=False,
-            next_route="clarify",
-            reason="문서 근거가 충분한지 판단하기 어려워요.",
-            clarify_question="어느 동(명동/을지로/필동/장충동/광희동/회현동/소공동/중림동)을 기준으로 알려드릴까요?",
-        )
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+    sys = SystemMessage(content=(
+        "너는 '주어진 문서 발췌로 질문에 답할 수 있는지'만 판정한다.\n"
+        "규칙:\n"
+        "- 문서 발췌에 직접 근거가 있으면 YES\n"
+        "- 근거가 부족하거나, 문서 밖 지식/실시간 정보/길찾기/교통/운영시간 단정 등이 필요하면 NO\n"
+        "출력은 오직 YES 또는 NO"
+    ))
+    user = HumanMessage(content=f"질문: {question}\n\n문서 발췌:\n{context}")
+    resp = llm.invoke([sys, user])
+    return (resp.content or "").strip().upper() == "YES"
