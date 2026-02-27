@@ -4,8 +4,6 @@ from agent.graph import run_agent
 st.set_page_config(page_title="중구 가이드 AI", page_icon="📍", layout="centered")
 
 st.title("📍 중구 가이드 AI")
-st.caption("서울 중구(명동/을지로/필동/장충동/광희동/회현동/소공동/중림동) 가이드북 기반 답변")
-
 # 세션에 대화 저장
 if "messages" not in st.session_state:
     st.session_state.messages = []
