@@ -9,3 +9,4 @@ tiktoken
 langchain-openai
 langchain-community
 langchain-text-splitters
+pydantic
