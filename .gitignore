@@ -1,4 +1,15 @@
 .env
-.venv
-db/chroma
+
+.venv/
+venv/
+
+db/
+db/chroma/
+
 __pycache__/
+*.pyc 
+*.pyo 
+
+.vscode/
+
+.DS_Store
