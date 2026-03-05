@@ -15,12 +15,14 @@ from agent.tools import (
     infer_dong_filter,
     judge_question,
     format_sources,
+    build_safe_alternatives,
+    infer_dong_name
 )
 
 from agent.prompts import SYSTEM_PROMPT, OUT_OF_SCOPE_PROMPT, CLARIFY_PROMPT, ANSWER_TEMPLATE_HINT
 
 
-Route = Literal["blocked", "out_of_scope", "ambiguous", "in_scope"]
+Route = Literal["blocked", "out_of_scope", "ambiguous", "in_scope", "unanswerable"]
 
 
 class AgentState(TypedDict, total=False):
@@ -66,6 +68,27 @@ def retrieve_node(state: AgentState) -> AgentState:
     docs = retriever.invoke(q)
     return {"docs": docs, "sources": format_sources(docs)}
 
+def unanswerable_node(state: AgentState) -> AgentState:
+    q = state["question"]
+
+    dong = infer_dong_name(q)
+    scope = dong if dong else "중구"
+
+    msg = (
+        "현재 시스템은 '서울 중구 가이드북 8종' 문서 내용으로만 답변합니다. "
+        "그래서 길찾기/대중교통/실시간 정보(운영시간·가격·전화번호 등)처럼 "
+        "문서로 단정하기 어려운 질문은 정확히 답변하기 어렵습니다.\n\n"
+        "대신 아래처럼 질문을 바꿔보세요:\n"
+        f"1. {scope} 가볼만한 곳 추천해줘\n"
+        f"2. {scope} 맛집 추천해줘\n"
+        f"3. {scope} 카페 추천해줘"
+    )
+
+    return {
+        "route": "unanswerable",
+        "answer": msg,
+        "sources": []
+    }
 
 # 3) Generate: 문서 근거 기반 답변
 def generate_node(state: AgentState) -> AgentState:
@@ -122,6 +145,7 @@ def build_graph():
 
     g.add_node("judge", judge_node)
     g.add_node("retrieve", retrieve_node)
+    g.add_node('unanswerable', unanswerable_node)
     g.add_node("generate", generate_node)
 
     g.set_entry_point("judge")
@@ -130,11 +154,16 @@ def build_graph():
         r = state.get("route")
         if r in ("blocked", "out_of_scope", "ambiguous"):
             return END
+
+        if r == 'in_scope' and state.get('answerable') is False:
+            return 'unanswerable'
+
         return "retrieve"
 
     g.add_conditional_edges("judge", after_judge)
     g.add_edge("retrieve", "generate")
     g.add_edge("generate", END)
+    g.add_edge('unanswerable', END)
 
     return g.compile()
 

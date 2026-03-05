@@ -46,6 +46,28 @@ def infer_dong_filter(question: str) -> Optional[Dict]:
             return {"source_file": pdf}
     return None
 
+def infer_dong_name(question: str) -> str | None:
+    for dong in DONG_TO_PDF.keys():
+        if dong in question:
+            return dong
+    return None
+
+def build_safe_alternatives(question: str) -> list[str]:
+    """
+    '문서로 답 가능한' 대안 질문만 고정 템플릿으로 생성.
+    길찾기/대중교통/운영시간/가격/전화번호 같은 실시간/정확정보는 절대 제안하지 않는다.
+    """
+    dong = infer_dong_filter(question)
+    scope = dong if dong else "중구(명동/을지로/필동/장충동/광희동/회현동/소공동/중림동)"
+
+    return [
+        f"{scope}에서 가볼만한 곳 추천해줘",
+        f"{scope} 맛집 추천해줘",
+        f"{scope} 카페 추천해줘",
+        f"{scope} 반나절 코스 짜줘",
+        f"{scope} 분위기/특징 알려줘",
+    ]
+
 
 def get_retriever(k: int = 5, metadata_filter: dict | None = None):
     """
