@@ -68,6 +68,7 @@ def retrieve_node(state: AgentState) -> AgentState:
     docs = retriever.invoke(q)
     return {"docs": docs, "sources": format_sources(docs)}
 
+
 def unanswerable_node(state: AgentState) -> AgentState:
     q = state["question"]
 

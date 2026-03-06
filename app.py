@@ -1,5 +1,5 @@
 import streamlit as st
-from agent.graph import run_agent
+import requests
 
 st.set_page_config(page_title="중구 가이드 AI", page_icon="📍", layout="centered")
 
@@ -43,7 +43,16 @@ if question:
 
     with st.chat_message("assistant"):
         with st.spinner("생각하는 중..."):
-            answer, sources, route = run_agent(final_question)
+            resp = requests.post(
+                "http://127.0.0.1:8000/chat",
+                json = {'question': final_question},
+                timeout = 60
+            )
+            data = resp.json()
+        
+        answer = data['answer']
+        sources = data['sources']
+        route = data['route']
 
         st.markdown(answer)
 
